@@ -705,13 +705,20 @@ class TimerNoop(BaseTimerContext):
 class TimerContext(BaseTimerContext):
     """Low resolution timeout context manager"""
 
-    __slots__ = ("_loop", "_tasks", "_cancelled", "_cancelling")
+    __slots__ = (
+        "_loop",
+        "_tasks",
+        "_cancelled",
+        "_cancelling",
+        "_actually_cancelled_tasks",
+    )
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         self._tasks: list[asyncio.Task[Any]] = []
         self._cancelled = False
         self._cancelling = 0
+        self._actually_cancelled_tasks: set[asyncio.Task[Any]] = set()
 
     def assert_timeout(self) -> None:
         """Raise TimeoutError if timer has already been cancelled."""
@@ -745,8 +752,12 @@ class TimerContext(BaseTimerContext):
         if self._tasks:
             enter_task = self._tasks.pop()
 
-        if exc_type is asyncio.CancelledError and self._cancelled:
+        if (
+            exc_type is asyncio.CancelledError
+            and enter_task in self._actually_cancelled_tasks
+        ):
             assert enter_task is not None
+            self._actually_cancelled_tasks.discard(enter_task)
             # The timeout was hit, and the task was cancelled
             # so we need to uncancel the last task that entered the context manager
             # since the cancellation should not leak out of the context manager
@@ -759,10 +770,20 @@ class TimerContext(BaseTimerContext):
             raise asyncio.TimeoutError from exc_val
         return None
 
+    def _cancel_once_genuinely_pending(self, task: "asyncio.Task[Any]") -> None:
+        if task.done() or task not in self._tasks:
+            return
+        fut_waiter = task._fut_waiter  # type: ignore[attr-defined]
+        if fut_waiter is not None and fut_waiter.done() and not fut_waiter.cancelled():
+            self._loop.call_soon(self._cancel_once_genuinely_pending, task)
+            return
+        self._actually_cancelled_tasks.add(task)
+        task.cancel()
+
     def timeout(self) -> None:
         if not self._cancelled:
             for task in set(self._tasks):
-                task.cancel()
+                self._cancel_once_genuinely_pending(task)
 
             self._cancelled = True
 

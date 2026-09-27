@@ -395,6 +395,144 @@ def test_timeout_handle_cb_exc(event_loop: asyncio.AbstractEventLoop) -> None:
     assert not handle._callbacks
 
 
+async def test_timer_context_does_not_cancel_task_whose_waiter_already_resolved() -> (
+    None
+):
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    finished = loop.create_future()
+
+    async def already_ready() -> None:
+        with ctx:
+            await finished
+
+    task = asyncio.ensure_future(already_ready())
+    await asyncio.sleep(0)
+    finished.set_result(None)
+    assert task._fut_waiter is not None  # type: ignore[attr-defined]
+    assert task._fut_waiter.done()  # type: ignore[attr-defined]
+
+    ctx.timeout()
+    await task
+
+    assert not task.cancelled()
+
+
+async def test_timer_context_still_cancels_genuinely_pending_task() -> None:
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    never_resolved = loop.create_future()
+
+    async def still_pending() -> None:
+        with ctx:
+            await never_resolved
+
+    task = asyncio.ensure_future(still_pending())
+    await asyncio.sleep(0)
+    assert task._fut_waiter is not None  # type: ignore[attr-defined]
+    assert not task._fut_waiter.done()  # type: ignore[attr-defined]
+
+    ctx.timeout()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await task
+
+
+async def test_timer_context_still_bounds_task_with_more_pending_work_after_ready_waiter() -> (
+    None
+):
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    first_step = loop.create_future()
+    second_step = loop.create_future()
+
+    async def multi_step() -> None:
+        with ctx:
+            await first_step
+            await second_step
+
+    task = asyncio.ensure_future(multi_step())
+    await asyncio.sleep(0)
+    first_step.set_result(None)
+
+    ctx.timeout()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await task
+
+
+async def test_timer_context_walks_a_chain_of_already_resolved_steps() -> None:
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    steps = [loop.create_future() for _ in range(5)]
+    final_step = loop.create_future()
+    for step in steps:
+        step.set_result(None)
+
+    async def many_steps() -> None:
+        with ctx:
+            for step in steps:
+                await step
+            await final_step
+
+    task = asyncio.ensure_future(many_steps())
+    await asyncio.sleep(0)
+
+    ctx.timeout()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await task
+
+
+async def test_timer_context_does_not_mislabel_unrelated_cancellation_as_timeout() -> (
+    None
+):
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    finished = loop.create_future()
+
+    async def already_done_then_separately_cancelled() -> str:
+        with ctx:
+            await finished
+        return "done"
+
+    task = asyncio.ensure_future(already_done_then_separately_cancelled())
+    await asyncio.sleep(0)
+    finished.set_result(None)
+
+    ctx.timeout()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_timer_context_does_not_cancel_unrelated_work_after_exit() -> None:
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    finished = loop.create_future()
+    unrelated = loop.create_future()
+
+    async def finishes_then_does_unrelated_work() -> str:
+        with ctx:
+            await finished
+        await unrelated
+        return "done"
+
+    task = asyncio.ensure_future(finishes_then_does_unrelated_work())
+    await asyncio.sleep(0)
+    finished.set_result(None)
+
+    ctx.timeout()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    unrelated.set_result(None)
+    result = await task
+
+    assert result == "done"
+
+
 def test_timer_context_not_cancelled() -> None:
     with mock.patch("aiohttp.helpers.asyncio") as m_asyncio:
         m_asyncio.TimeoutError = asyncio.TimeoutError

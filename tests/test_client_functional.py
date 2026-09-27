@@ -12,6 +12,7 @@ import socket
 import ssl
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 import zlib
@@ -55,7 +56,8 @@ from aiohttp.client_exceptions import (
     SocketTimeoutError,
     TooManyRedirects,
 )
-from aiohttp.client_reqrep import ClientRequest
+from aiohttp.client_reqrep import ClientRequest, ClientResponse
+from aiohttp.connector import Connection
 from aiohttp.helpers import DEFAULT_CHUNK_SIZE
 from aiohttp.payload import (
     AsyncIterablePayload,
@@ -4406,6 +4408,55 @@ async def test_read_timeout_closes_connection(aiohttp_client: AiohttpClient) -> 
 
     # Make sure its not closed
     assert client.session.connector._conns
+
+
+async def test_total_timeout_does_not_discard_already_arrived_response() -> None:
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    server_ready = threading.Event()
+    server_stopped = threading.Event()
+    base_urls: list[str] = []
+
+    def run_server() -> None:
+        async def server_main() -> None:
+            app = web.Application()
+            app.add_routes([web.get("/", handler)])
+            server = TestServer(app)
+            await server.start_server()
+            base_urls.append(f"http://{server.host}:{server.port}")
+            server_ready.set()
+            while not server_stopped.is_set():
+                await asyncio.sleep(0.01)
+            await server.close()
+
+        asyncio.run(server_main())
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    server_ready.wait()
+    base_url = base_urls[0]
+
+    def hog() -> None:
+        time.sleep(0.2)
+
+    orig_start = ClientResponse.start
+
+    async def start_and_freeze_loop(
+        self: ClientResponse, connection: Connection
+    ) -> ClientResponse:
+        asyncio.get_running_loop().call_soon(hog)
+        return await orig_start(self, connection)
+
+    with mock.patch.object(ClientResponse, "start", start_and_freeze_loop):
+        async with aiohttp.ClientSession() as session:
+            resp = await session.get(
+                f"{base_url}/", timeout=aiohttp.ClientTimeout(total=0.1)
+            )
+            assert resp.status == 200
+
+    server_stopped.set()
+    server_thread.join(timeout=2)
 
 
 async def test_read_timeout_on_prepared_response(aiohttp_client: AiohttpClient) -> None:
